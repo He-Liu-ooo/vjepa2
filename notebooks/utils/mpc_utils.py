@@ -111,7 +111,27 @@ def cem(
             )
 
             # -- compute next state
+            try:
+                logger.info(
+                    "Before world_model: frame_traj: %s, action_traj: %s, pose_traj: %s",
+                    tuple(frame_traj.shape),
+                    tuple(action_traj.shape),
+                    tuple(pose_traj.shape),
+                )
+            except Exception:
+                logger.info("Could not log WM input shapes")
+
             next_frame, next_pose = world_model(frame_traj, action_traj, pose_traj)
+
+            try:
+                logger.info(
+                    "After world_model: next_frame: %s, next_pose: %s",
+                    tuple(next_frame.shape),
+                    tuple(next_pose.shape),
+                )
+            except Exception:
+                logger.info("Could not log WM output shapes")
+                
             frame_traj = torch.cat([frame_traj, next_frame], dim=1)
             pose_traj = torch.cat([pose_traj, next_pose], dim=1)
 
@@ -124,32 +144,47 @@ def cem(
         selected_actions = actions[indices]
         return selected_actions
 
-    for step in tqdm(range(cem_steps), disable=True):
-        action_traj, frame_traj = sample_action_traj()
-        selected_actions = select_topk_action_traj(
-            final_state=frame_traj[:, -1], goal_state=goal_frame, actions=action_traj
-        )
-        mean_selected_actions = selected_actions.mean(dim=0)
-        std_selected_actions = selected_actions.std(dim=0)
-
-        # -- Update new sampling mean and std based on the top-k samples
-        mean = torch.cat(
-            [
-                mean_selected_actions[..., :3] * (1.0 - momentum_mean) + mean[..., :3] * momentum_mean,
-                mean_selected_actions[..., -1:] * (1.0 - momentum_mean_gripper)
-                + mean[..., -1:] * momentum_mean_gripper,
+    with torch.profiler.profile(
+            activities=[
+                torch.profiler.ProfilerActivity.CPU,
+                torch.profiler.ProfilerActivity.CUDA
             ],
-            dim=-1,
-        )
-        std = torch.cat(
-            [
-                std_selected_actions[..., :3] * (1.0 - momentum_std) + std[..., :3] * momentum_std,
-                std_selected_actions[..., -1:] * (1.0 - momentum_std_gripper) + std[..., -1:] * momentum_std_gripper,
-            ],
-            dim=-1,
-        )
+            schedule=torch.profiler.schedule(wait=0, warmup=0, active=1),
+            on_trace_ready=torch.profiler.tensorboard_trace_handler('/home/hel19/workspace/repos/neural_network/vjepa2/output/profiling/mpc', worker_name='worker0'),
+            record_shapes=True,
+            profile_memory=True,
+            with_stack=True,
+            with_flops=True
+        ) as prof:
+        
+        for step in tqdm(range(cem_steps), disable=True):
+            action_traj, frame_traj = sample_action_traj()
+            selected_actions = select_topk_action_traj(
+                final_state=frame_traj[:, -1], goal_state=goal_frame, actions=action_traj
+            )
+            mean_selected_actions = selected_actions.mean(dim=0)
+            std_selected_actions = selected_actions.std(dim=0)
 
-        logger.info(f"new mean: {mean.sum(dim=0)} {std.sum(dim=0)}")
+            # -- Update new sampling mean and std based on the top-k samples
+            mean = torch.cat(
+                [
+                    mean_selected_actions[..., :3] * (1.0 - momentum_mean) + mean[..., :3] * momentum_mean,
+                    mean_selected_actions[..., -1:] * (1.0 - momentum_mean_gripper)
+                    + mean[..., -1:] * momentum_mean_gripper,
+                ],
+                dim=-1,
+            )
+            std = torch.cat(
+                [
+                    std_selected_actions[..., :3] * (1.0 - momentum_std) + std[..., :3] * momentum_std,
+                    std_selected_actions[..., -1:] * (1.0 - momentum_std_gripper) + std[..., -1:] * momentum_std_gripper,
+                ],
+                dim=-1,
+            )
+
+            prof.step()
+            
+            logger.info(f"new mean: {mean.sum(dim=0)} {std.sum(dim=0)}")
 
     new_action = torch.cat(
         [

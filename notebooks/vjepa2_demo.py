@@ -56,7 +56,7 @@ def build_pt_video_transform(img_size):
 
 
 def get_video():
-    vr = VideoReader("sample_video.mp4")
+    vr = VideoReader("input/sample_video.mp4")
     # choosing some frames here, you can define more complex sampling strategy
     frame_idx = np.arange(0, 128, 2)
     video = vr.get_batch(frame_idx).asnumpy()
@@ -64,22 +64,43 @@ def get_video():
 
 
 def forward_vjepa_video(model_hf, model_pt, hf_transform, pt_transform):
-    # Run a sample inference with VJEPA
+    # Run a sample inference with VJEPA. The HuggingFace path is optional; if
+    # model_hf is None the HF comparison will be skipped so this can run
+    # offline with local PT weights only.
+    # ------------------------------------------------------------------
+    # Original HF-enabled forward (kept commented for reference):
+    # with torch.inference_mode():
+    #     # Read and pre-process the image
+    #     video = get_video()  # T x H x W x C
+    #     video = torch.from_numpy(video).permute(0, 3, 1, 2)  # T x C x H x W
+    #     x_pt = pt_transform(video).cuda().unsqueeze(0)
+    #     x_hf = hf_transform(video, return_tensors="pt")["pixel_values_videos"].to("cuda")
+    #     # Extract the patch-wise features from the last layer
+    #     out_patch_features_pt = model_pt(x_pt)
+    #     out_patch_features_hf = model_hf.get_vision_features(x_hf)
+    #
+    # return out_patch_features_hf, out_patch_features_pt
+    # ------------------------------------------------------------------
     with torch.inference_mode():
         # Read and pre-process the image
         video = get_video()  # T x H x W x C
         video = torch.from_numpy(video).permute(0, 3, 1, 2)  # T x C x H x W
         x_pt = pt_transform(video).cuda().unsqueeze(0)
-        x_hf = hf_transform(video, return_tensors="pt")["pixel_values_videos"].to("cuda")
-        # Extract the patch-wise features from the last layer
+
+        # PyTorch model forward
         out_patch_features_pt = model_pt(x_pt)
-        out_patch_features_hf = model_hf.get_vision_features(x_hf)
+
+        # Optionally run HuggingFace model if provided
+        out_patch_features_hf = None
+        if model_hf is not None and hf_transform is not None:
+            x_hf = hf_transform(video, return_tensors="pt")["pixel_values_videos"].to("cuda")
+            out_patch_features_hf = model_hf.get_vision_features(x_hf)
 
     return out_patch_features_hf, out_patch_features_pt
 
 
 def get_vjepa_video_classification_results(classifier, out_patch_features_pt):
-    SOMETHING_SOMETHING_V2_CLASSES = json.load(open("ssv2_classes.json", "r"))
+    SOMETHING_SOMETHING_V2_CLASSES = json.load(open("input/ ssv2_classes.json", "r"))
 
     with torch.inference_mode():
         out_classifier = classifier(out_patch_features_pt)
@@ -102,9 +123,9 @@ def run_sample_inference():
         "facebook/vjepa2-vitg-fpc64-384"  # Replace with your favored model, e.g. facebook/vjepa2-vitg-fpc64-384
     )
     # Path to local PyTorch weights
-    pt_model_path = "YOUR_MODEL_PATH"
+    pt_model_path = "/home/hel19/workspace/dataset/V-JEPA-2/vitg-384.pt"
 
-    sample_video_path = "sample_video.mp4"
+    sample_video_path = "input/sample_video.mp4"
     # Download the video if not yet downloaded to local path
     if not os.path.exists(sample_video_path):
         video_url = "https://huggingface.co/datasets/nateraw/kinetics-mini/resolve/main/val/bowling/-WH-lxmGJVY_000005_000015.mp4"
@@ -112,13 +133,21 @@ def run_sample_inference():
         subprocess.run(command)
         print("Downloading video")
 
+    # HuggingFace comparison disabled for offline/demo use: skip HF model and
+    # processor and use only local PyTorch weights. Hardcode img_size to the
+    # expected crop size for the PT model.
+    # (The original HF-enabled initialization is kept commented for reference)
     # Initialize the HuggingFace model, load pretrained weights
-    model_hf = AutoModel.from_pretrained(hf_model_name)
-    model_hf.cuda().eval()
+    # model_hf = AutoModel.from_pretrained(hf_model_name, local_files_only=True)
+    # model_hf.cuda().eval()
 
     # Build HuggingFace preprocessing transform
-    hf_transform = AutoVideoProcessor.from_pretrained(hf_model_name)
-    img_size = hf_transform.crop_size["height"]  # E.g. 384, 256, etc.
+    # hf_transform = AutoVideoProcessor.from_pretrained(hf_model_name, local_files_only=True)
+    # img_size = hf_transform.crop_size["height"]  # E.g. 384, 256, etc.
+
+    model_hf = None
+    hf_transform = None
+    img_size = 384
 
     # Initialize the PyTorch model, load pretrained weights
     model_pt = vit_giant_xformers_rope(img_size=(img_size, img_size), num_frames=64)
@@ -133,25 +162,42 @@ def run_sample_inference():
         model_hf, model_pt, hf_transform, pt_video_transform
     )
 
-    print(
-        f"""
-        Inference results on video:
-        HuggingFace output shape: {out_patch_features_hf.shape}
-        PyTorch output shape:     {out_patch_features_pt.shape}
-        Absolute difference sum:  {torch.abs(out_patch_features_pt - out_patch_features_hf).sum():.6f}
-        Close: {torch.allclose(out_patch_features_pt, out_patch_features_hf, atol=1e-3, rtol=1e-3)}
-        """
-    )
+    # Original HF comparison print (kept commented):
+    # print(
+    #     f"""
+    #     Inference results on video:
+    #     HuggingFace output shape: {out_patch_features_hf.shape}
+    #     PyTorch output shape:     {out_patch_features_pt.shape}
+    #     Absolute difference sum:  {torch.abs(out_patch_features_pt - out_patch_features_hf).sum():.6f}
+    #     Close: {torch.allclose(out_patch_features_pt, out_patch_features_hf, atol=1e-3, rtol=1e-3)}
+    #     """
+    # )
+
+    # Print results. If HF output is not available (offline mode), only print PT results.
+    if out_patch_features_hf is not None:
+        print(
+            f"""
+            Inference results on video:
+            HuggingFace output shape: {out_patch_features_hf.shape}
+            PyTorch output shape:     {out_patch_features_pt.shape}
+            Absolute difference sum:  {torch.abs(out_patch_features_pt - out_patch_features_hf).sum():.6f}
+            Close: {torch.allclose(out_patch_features_pt, out_patch_features_hf, atol=1e-3, rtol=1e-3)}
+            """
+        )
+    else:
+        print(
+            f"Inference results on video:\nPyTorch output shape: {out_patch_features_pt.shape}\n( HuggingFace output skipped - offline mode )"
+        )
 
     # Initialize the classifier
-    classifier_model_path = "YOUR_ATTENTIVE_PROBE_PATH"
+    classifier_model_path = "/home/hel19/workspace/dataset/V-JEPA-2/ssv2-vitg-384-64x2x3.pt"
     classifier = (
         AttentiveClassifier(embed_dim=model_pt.embed_dim, num_heads=16, depth=4, num_classes=174).cuda().eval()
     )
     load_pretrained_vjepa_classifier_weights(classifier, classifier_model_path)
 
     # Download SSV2 classes if not already present
-    ssv2_classes_path = "ssv2_classes.json"
+    ssv2_classes_path = "input/ssv2_classes.json"
     if not os.path.exists(ssv2_classes_path):
         command = [
             "wget",

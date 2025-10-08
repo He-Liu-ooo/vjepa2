@@ -14,8 +14,8 @@ experiment:
     num_probe_blocks: 4
   data:
     dataset_type: VideoDataset
-    dataset_train: /your_data_path/ssv2_train_paths.csv
-    dataset_val: /your_data_path/ssv2_val_paths.csv
+    dataset_train: /home/hel19/workspace/repos/neural_network/vjepa2/input/ssv2_train_paths.csv
+    dataset_val: /home/hel19/workspace/repos/neural_network/vjepa2/input/ssv2_val_paths.csv
     frame_step: 2
     frames_per_clip: 64
     num_classes: 174
