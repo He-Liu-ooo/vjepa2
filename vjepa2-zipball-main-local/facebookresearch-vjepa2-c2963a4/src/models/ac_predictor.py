@@ -16,6 +16,10 @@ from src.models.utils.modules import ACBlock as Block
 from src.models.utils.modules import build_action_block_causal_attention_mask
 from src.utils.tensors import trunc_normal_
 
+import logging
+
+# Configure module logger
+logger = logging.getLogger(__name__)
 
 class VisionTransformerPredictorAC(nn.Module):
     """Action Conditioned Vision Transformer Predictor"""
@@ -173,23 +177,33 @@ class VisionTransformerPredictorAC(nn.Module):
         :param x: context tokens
         """
         # Map tokens to predictor dimensions
+        logger.debug(f"Before self.predictor_embed: x: {x.shape}")
         x = self.predictor_embed(x)
+        logger.debug(f"After self.predictor_embed: x: {x.shape}")
         B, N_ctxt, D = x.size()
         T = N_ctxt // (self.grid_height * self.grid_width)
 
         # Interleave action tokens
+        logger.debug(f"Before self.state_encoder: states: {states.shape}")
         s = self.state_encoder(states).unsqueeze(2)
+        logger.debug(f"After self.state_encoder: s: {s.shape}")
+        logger.debug(f"Before self.action_encoder: actions: {actions.shape}")
         a = self.action_encoder(actions).unsqueeze(2)
+        logger.debug(f"After self.action_encoder: a: {a.shape}")
         x = x.view(B, T, self.grid_height * self.grid_width, D)  # [B, T, H*W, D]
         if self.use_extrinsics:
             e = self.extrinsics_encoder(extrinsics).unsqueeze(2)
             x = torch.cat([a, s, e, x], dim=2).flatten(1, 2)  # [B, T*(H*W+3), D]
         else:
+            # this branch
+            logger.debug(f"Before concat a,s,x: a: {a.shape}, s: {s.shape}, x: {x.shape}")
             x = torch.cat([a, s, x], dim=2).flatten(1, 2)  # [B, T*(H*W+2), D]
 
         cond_tokens = 3 if self.use_extrinsics else 2
         attn_mask = self.attn_mask[: x.size(1), : x.size(1)].to(x.device, non_blocking=True)
 
+        logger.debug(f"self.use_activation_checkpointing: {self.use_activation_checkpointing}, self.use_extrinsics: {self.use_extrinsics}")
+        
         # Fwd prop
         for i, blk in enumerate(self.predictor_blocks):
             if self.use_activation_checkpointing:
@@ -205,6 +219,8 @@ class VisionTransformerPredictorAC(nn.Module):
                     use_reentrant=False,
                 )
             else:
+                # this branch, cond_tokens=2
+                logger.debug(f"Before blk: x: {x.shape}")
                 x = blk(
                     x,
                     mask=None,
@@ -216,11 +232,15 @@ class VisionTransformerPredictorAC(nn.Module):
                 )
 
         # Split out action and frame tokens
+        logger.debug(f"After net: x: {x.shape}")
         x = x.view(B, T, cond_tokens + self.grid_height * self.grid_width, D)  # [B, T, K+H*W, D]
         x = x[:, :, cond_tokens:, :].flatten(1, 2)
 
+        logger.debug(f"Before self.predictor_norm: x: {x.shape}")
         x = self.predictor_norm(x)
+        logger.debug(f"After self.predictor_norm: x: {x.shape}")
         x = self.predictor_proj(x)
+        logger.debug(f"After self.predictor_proj: x: {x.shape}")
 
         return x
 

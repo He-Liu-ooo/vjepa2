@@ -1,0 +1,1 @@
+tensorboard --logdir /home/hel19/workspace/repos/neural_network/vjepa2/output/profiling/torch_profiler/2025-12-08-17-29/

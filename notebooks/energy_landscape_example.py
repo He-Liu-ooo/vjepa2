@@ -1,15 +1,44 @@
 import sys
 import os
-import logging
 # Ensure the repository root (one level up from this notebook/script) is on sys.path.
+import logging
+import logging.config
 # Using __file__ makes the import robust no matter the current working directory.
 HERE = os.path.abspath(os.path.dirname(__file__))
 REPO_ROOT = os.path.abspath(os.path.join(HERE, ".."))
 if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
 
-# Configure module logger
-logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(asctime)s %(name)s %(message)s")
+import logging
+import logging.config
+
+# --- remove any handlers previously attached to root ---
+root = logging.getLogger()
+for h in list(root.handlers):   # copy list() to avoid mutation-during-iteration
+    root.removeHandler(h)
+
+# --- now configure logging centrally ---
+LOGGING = {
+    'version': 1,
+    'disable_existing_loggers': False,
+    'formatters': {
+        'default': {'format': '[%(levelname)s] %(asctime)s %(name)s %(message)s'}
+    },
+    'handlers': {
+        'console': {
+            'class': 'logging.StreamHandler',
+            'formatter': 'default',
+            'level': 'DEBUG',
+        }
+    },
+    'root': {
+        'handlers': ['console'],
+        'level': 'INFO',
+    }
+}
+logging.config.dictConfig(LOGGING)
+# Define a module logger after centralized configuration so subsequent
+# `logger.*` calls work as expected (prevents NameError when using `logger`).
 logger = logging.getLogger(__name__)
 
 import numpy as np
@@ -40,13 +69,6 @@ logger.info("Using device: %s", device)
 # Print/log the encoder class so we can verify what implementation was loaded.
 logger.info("Loaded encoder type: %s", encoder.__class__.__module__ + "." + encoder.__class__.__name__)
 logger.info("Loaded predictor type: %s", predictor.__class__.__module__ + "." + predictor.__class__.__name__)
-# logger.info("Encoder repr: %s", repr(encoder))
-# try:
-#     # Show the file that defines the encoder class so we can see which copy was loaded
-#     encoder_file = inspect.getfile(encoder.__class__)
-#     logger.info("Encoder class defined in file: %s", encoder_file)
-# except Exception:
-#     logger.info("Could not determine encoder class file path")
 
 # Initialize transform
 crop_size = 256
@@ -65,13 +87,16 @@ def forward_target(c, normalize_reps=True):
     B, C, T, H, W = c.size()
     # ensure input is on the same device as the models
     c = c.to(device)
+    logger.debug("Before permute: c: %s", c.shape)
     c = c.permute(0, 2, 1, 3, 4).flatten(0, 1).unsqueeze(2).repeat(1, 1, 2, 1, 1)
-    logger.info("Before encoder: c: %s", c.shape)
+    logger.debug("Before encoder: c: %s", c.shape)
     h = encoder(c)
-    logger.info("After encoder: h: %s", h.shape)
+    logger.debug("After encoder: h: %s", h.shape)
     h = h.view(B, T, -1, h.size(-1)).flatten(1, 2)
+    logger.debug("After view: h: %s", h.shape)
     if normalize_reps:
         h = F.layer_norm(h, (h.size(-1),))
+        logger.debug("After layer_norm: h: %s", h.shape)
     return h
 
 
@@ -129,6 +154,7 @@ def main():
     if play_in_reverse:
         np_clips = trajectory["observations"][:, ::-1].copy()
         np_states = trajectory["states"][:, ::-1].copy()
+    # [1, 1, D_act], derived from the difference of states
     np_actions = np.expand_dims(poses_to_diff(np_states[0, 0], np_states[0, 1]), axis=(0, 1))
 
     # Convert trajectory to torch tensors
@@ -196,10 +222,10 @@ def main():
         # Doing very few CEM iterations with very few samples just to run efficiently on CPU...
         # ... increase cem_steps and samples for more accurate optimization of energy landscape
         mpc_args={
-            "rollout": 3,
+            "rollout": 4,
             "samples": 25,
             "topk": 10,
-            "cem_steps": 2,
+            "cem_steps": 4,
             "momentum_mean": 0.15,
             "momentum_mean_gripper": 0.15,
             "momentum_std": 0.75,
@@ -211,6 +237,15 @@ def main():
         device=device,
     )
 
+    # root = logging.getLogger()
+    # print('root.level:', root.level, 'root.getEffectiveLevel():', root.getEffectiveLevel())
+    # print('root.handlers:', root.handlers)
+    # lg = logging.getLogger(__name__)
+    # print('__name__ logger level:', lg.level, 'effective:', lg.getEffectiveLevel())
+    # print('isEnabledFor DEBUG:', lg.isEnabledFor(logging.DEBUG))
+    # for i,h in enumerate(root.handlers):
+    #     print(i, type(h), 'handler.level =', h.level)
+    
     with torch.no_grad():
         h = forward_target(clips)
         z_n, z_goal = h[:, :tokens_per_frame], h[:, -tokens_per_frame:]
@@ -219,12 +254,12 @@ def main():
 
         # Debug: print shapes of the tensors used for planning
         try:
-            logger.info("z_n shape: %s", tuple(z_n.shape))
-            logger.info("s_n shape: %s", tuple(s_n.shape))
-            logger.info("z_goal shape: %s", tuple(z_goal.shape))
-            logger.info("tokens_per_frame: %d", tokens_per_frame)
+            logger.debug("z_n shape: %s", tuple(z_n.shape))
+            logger.debug("s_n shape: %s", tuple(s_n.shape))
+            logger.debug("z_goal shape: %s", tuple(z_goal.shape))
+            logger.debug("tokens_per_frame: %d", tokens_per_frame)
         except Exception:
-            logger.info("Could not log tensor shapes for z_n/s_n/z_goal")
+            logger.debug("Could not log tensor shapes for z_n/s_n/z_goal")
 
         actions_out = world_model.infer_next_action(z_n, s_n, z_goal).cpu().numpy()
 

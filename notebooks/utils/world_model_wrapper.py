@@ -8,6 +8,11 @@ import torch.nn.functional as F
 
 from .mpc_utils import cem, compute_new_pose
 
+import logging
+
+# Configure module logger
+logger = logging.getLogger(__name__)
+
 
 class WorldModel(object):
 
@@ -56,9 +61,12 @@ class WorldModel(object):
         def step_predictor(reps, actions, poses):
             B, T, N_T, D = reps.size()
             reps = reps.flatten(1, 2)
+            logger.debug(f"before predictor: reps: {reps.shape}, actions: {actions.shape}, poses: {poses.shape}")
             next_rep = self.predictor(reps, actions, poses)[:, -self.tokens_per_frame :]
+            logger.debug(f"after predictor: next_rep: {next_rep.shape}")
             if self.normalize_reps:
                 next_rep = F.layer_norm(next_rep, (next_rep.size(-1),))
+            logger.debug(f"after layer_norm: next_rep: {next_rep.shape}")
             next_rep = next_rep.view(B, 1, N_T, D)
             next_pose = compute_new_pose(poses[:, -1:], actions[:, -1:])
             return next_rep, next_pose
@@ -68,6 +76,7 @@ class WorldModel(object):
             context_pose=pose,
             goal_frame=goal_rep,
             world_model=step_predictor,
+            world_model_module=self.predictor,
             close_gripper=close_gripper,
             **self.mpc_args,
         )[0]

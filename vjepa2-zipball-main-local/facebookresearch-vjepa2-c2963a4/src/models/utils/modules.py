@@ -8,6 +8,12 @@ import torch.nn as nn
 import torch.nn.functional as F
 from timm.models.layers import drop_path
 
+import logging
+
+# Module logger - do NOT configure root logger here.
+# Configure logging centrally in the application's entrypoint (e.g. `app/main.py` or `run.sh`).
+logger = logging.getLogger(__name__)
+
 
 def build_action_block_causal_attention_mask(T, H, W, add_tokens=1):
     N_T = add_tokens + (H * W)
@@ -158,8 +164,15 @@ class ACRoPEAttention(nn.Module):
         tokens_per_frame = int(H_patches * W_patches)
         tokens_per_row = W_patches
         frame_ids = self._get_frame_pos(ids, H_patches, W_patches)
+        # tokens_per_frame = int(H_patches * W_patches)
+        # ids // tokens_per_frame
         # --
         height_ids = self._get_height_pos(ids, H_patches, W_patches)
+        # tokens_per_frame = int(H_patches * W_patches)
+        # tokens_per_row = W_patches
+        # frame_ids = self._get_frame_pos(ids, H_patches, W_patches)
+        # ids = ids - tokens_per_frame * frame_ids
+        # ids // tokens_per_row
         # --
         # Remove frame component from ids (1st term) and height component (2nd term)
         width_ids = (ids - tokens_per_frame * frame_ids) - tokens_per_row * height_ids
@@ -169,10 +182,13 @@ class ACRoPEAttention(nn.Module):
         B, N, C = x.size()
 
         # -- compute position of each frame token
+        logger.debug(f"attn_mask.shape: {attn_mask.shape}, T: {T}, H: {H}, W: {W}, action_tokens: {action_tokens}")
+        logger.debug(f"In ACRoPEAttention forward: mask is not None: {mask is not None}, self.num_heads: {self.num_heads}, self.head_dim: {self.head_dim}")
         if mask is not None:
             mask = mask.unsqueeze(1).repeat(1, self.num_heads, 1)
             d_mask, h_mask, w_mask = self.separate_positions(mask, H, W)
         else:
+            # this branch
             mask = torch.arange(int(T * H * W), device=x.device)
             d_mask, h_mask, w_mask = self.separate_positions(mask, H, W)
 
@@ -182,45 +198,72 @@ class ACRoPEAttention(nn.Module):
 
         # -- split out action tokens from sequence
         if action_tokens > 0:
+            logger.debug(f"In ACRoPEAttention forward: before view: x.shape: {x.shape}, action_tokens: {action_tokens}")
             x = x.view(B, -1, action_tokens + H * W, C)  # [B, T, 1+H*W, D]
+            logger.debug(f"In ACRoPEAttention forward: after view: x.shape: {x.shape}, action_tokens: {action_tokens}")
 
             action_q, action_k, action_v = [], [], []
             for i in range(action_tokens):
+                logger.debug(f"In ACRoPEAttention forward: ------------------------- action_token index: {i} -------------------------")
                 a = x[:, :, i : i + 1, :].flatten(1, 2)
+                logger.debug(f"In ACRoPEAttention forward: after flatten: a.shape: {a.shape}")
                 # Note action tokens do not work with masking
                 # -- compute qkv for action tokens and rotate
                 qkv = self.qkv(a).unflatten(-1, (3, self.num_heads, -1)).permute(2, 0, 3, 1, 4)
+                logger.debug(f"In ACRoPEAttention forward: after flatten: qkv.shape: {qkv.shape}")
                 q, k, v = qkv[0], qkv[1], qkv[2]  # [B, num_heads, N, D]
                 # --
                 qd = rotate_queries_or_keys(q[..., : self.d_dim], pos=torch.arange(T, device=x.device))
                 kd = rotate_queries_or_keys(k[..., : self.d_dim], pos=torch.arange(T, device=x.device))
+                logger.debug(f"In ACRoPEAttention forward: after rotate_queries_or_keys: qd.shape: {qd.shape}")
+                logger.debug(f"In ACRoPEAttention forward: after rotate_queries_or_keys: kd.shape: {kd.shape}")
                 qr = q[..., self.d_dim :]
                 kr = k[..., self.d_dim :]
+                logger.debug(f"In ACRoPEAttention forward: qr.shape: {qr.shape}")
+                logger.debug(f"In ACRoPEAttention forward: kr.shape: {kr.shape}")
                 action_q += [torch.cat([qd, qr], dim=-1).view(B, self.num_heads, T, 1, -1)]
                 action_k += [torch.cat([kd, kr], dim=-1).view(B, self.num_heads, T, 1, -1)]
                 action_v += [v.view(B, self.num_heads, T, 1, -1)]
+                try:
+                    logger.debug(f"In ACRoPEAttention forward: action_q list len: {len(action_q)}, action_k list len: {len(action_k)}, action_v list len: {len(action_v)}")
+                    logger.debug("In ACRoPEAttention forward: action_q element shapes: %s", [tuple(t.shape) for t in action_q])
+                    logger.debug("In ACRoPEAttention forward: action_k element shapes: %s", [tuple(t.shape) for t in action_k])
+                    logger.debug("In ACRoPEAttention forward: action_v element shapes: %s", [tuple(t.shape) for t in action_v])
+                except Exception:
+                    logger.debug("Could not log action_q list shapes")
 
             action_q = torch.cat(action_q, dim=3).flatten(2, 3)
             action_k = torch.cat(action_k, dim=3).flatten(2, 3)
             action_v = torch.cat(action_v, dim=3).flatten(2, 3)
+            try:
+                logger.debug("In ACRoPEAttention forward: action_q tensor shape after cat+flatten: %s", tuple(action_q.shape))
+                logger.debug("In ACRoPEAttention forward: action_k tensor shape after cat+flatten: %s", tuple(action_k.shape))
+                logger.debug("In ACRoPEAttention forward: action_v tensor shape after cat+flatten: %s", tuple(action_v.shape))
+            except Exception:
+                logger.debug("Could not log concatenated action_q/k/v shapes")
             x = x[:, :, action_tokens:, :].flatten(1, 2)
+            logger.debug("In ACRoPEAttention forward: x tensor shape after cat+flatten: %s", tuple(x.shape))
 
         # -- compute qkv for frame tokens and rotate
         qkv = self.qkv(x).unflatten(-1, (3, self.num_heads, -1)).permute(2, 0, 3, 1, 4)
+        logger.debug(f"In ACRoPEAttention forward: (x) after flatten: qkv.shape: {qkv.shape}")
         q, k, v = qkv[0], qkv[1], qkv[2]  # [B, num_heads, N, D]
 
         s = 0
         # Rotate depth
         qd = rotate_queries_or_keys(q[..., s : s + self.d_dim], pos=d_mask)
         kd = rotate_queries_or_keys(k[..., s : s + self.d_dim], pos=d_mask)
+        logger.debug(f"In ACRoPEAttention forward: (x) after rotate_queries_or_keys: qd.shape: {qd.shape}, kd.shape: {kd.shape}")
         s += self.d_dim
         # Rotate height dim
         qh = rotate_queries_or_keys(q[..., s : s + self.h_dim], pos=h_mask)
         kh = rotate_queries_or_keys(k[..., s : s + self.h_dim], pos=h_mask)
+        logger.debug(f"In ACRoPEAttention forward: (x) after rotate_queries_or_keys: qh.shape: {qh.shape}, kh.shape: {kh.shape}")
         s += self.h_dim
         # Rotate width dim
         qw = rotate_queries_or_keys(q[..., s : s + self.w_dim], pos=w_mask)
         kw = rotate_queries_or_keys(k[..., s : s + self.w_dim], pos=w_mask)
+        logger.debug(f"In ACRoPEAttention forward: (x) after rotate_queries_or_keys: qw.shape: {qw.shape}, kw.shape: {kw.shape}")
         s += self.w_dim
 
         # Combine rotated dimension
@@ -232,7 +275,8 @@ class ACRoPEAttention(nn.Module):
         else:
             q = torch.cat([qd, qh, qw], dim=-1)
             k = torch.cat([kd, kh, kw], dim=-1)
-
+        logger.debug(f"In ACRoPEAttention forward: after combining rotated dims: q.shape: {q.shape}, k.shape: {k.shape}")
+        
         if action_tokens > 0:
 
             def merge_(tx, ta):
@@ -244,12 +288,42 @@ class ACRoPEAttention(nn.Module):
             q = merge_(q, action_q)
             k = merge_(k, action_k)
             v = merge_(v, action_v)
+        logger.debug(f"In ACRoPEAttention forward: after merging action tokens: q.shape: {q.shape}, k.shape: {k.shape}, v.shape: {v.shape}")
 
+        logger.debug(f"In ACRoPEAttention forward: attn_mask is not None or self.use_sdpa: {attn_mask is not None or self.use_sdpa}, self.dropout_p: {self.proj_drop_prob}, self.is_causal: {self.is_causal}")
         if attn_mask is not None or self.use_sdpa:
+            # this branch
             with torch.backends.cuda.sdp_kernel():
                 x = F.scaled_dot_product_attention(
                     q, k, v, dropout_p=self.proj_drop_prob, is_causal=self.is_causal, attn_mask=attn_mask
                 )
+                # def scaled_dot_product_attention(query, key, value, attn_mask=None, dropout_p=0.0,
+                # is_causal=False, scale=None, enable_gqa=False) -> torch.Tensor:
+                #     L, S = query.size(-2), key.size(-2)
+                #     scale_factor = 1 / math.sqrt(query.size(-1)) if scale is None else scale
+                #     attn_bias = torch.zeros(L, S, dtype=query.dtype, device=query.device)
+                #     if is_causal:
+                #         assert attn_mask is None
+                #         temp_mask = torch.ones(L, S, dtype=torch.bool).tril(diagonal=0)
+                #         attn_bias.masked_fill_(temp_mask.logical_not(), float("-inf"))
+                #         attn_bias.to(query.dtype)
+
+                #     if attn_mask is not None:
+                #         if attn_mask.dtype == torch.bool:
+                #             attn_bias.masked_fill_(attn_mask.logical_not(), float("-inf"))
+                #         else:
+                #             attn_bias = attn_mask + attn_bias
+
+                #     if enable_gqa:
+                #         key = key.repeat_interleave(query.size(-3)//key.size(-3), -3)
+                #         value = value.repeat_interleave(query.size(-3)//value.size(-3), -3)
+
+                #     attn_weight = query @ key.transpose(-2, -1) * scale_factor
+                #     attn_weight += attn_bias
+                #     attn_weight = torch.softmax(attn_weight, dim=-1)
+                #     attn_weight = torch.dropout(attn_weight, dropout_p, train=True)
+                #     return attn_weight @ value
+                logger.debug(f"In ACRoPEAttention forward: after F.scaled_dot_product_attention: x.shape: {x.shape}")
                 attn = None
         else:
             attn = (q @ k.transpose(-2, -1)) * self.scale  # [B, num_heads, D, D]
@@ -258,7 +332,9 @@ class ACRoPEAttention(nn.Module):
             x = attn @ v
 
         x = x.transpose(1, 2).reshape(B, N, C)
+        logger.debug(f"In ACRoPEAttention forward: before proj: x.shape: {x.shape}")
         x = self.proj(x)
+        logger.debug(f"In ACRoPEAttention forward: after proj: x.shape: {x.shape}")
         x = self.proj_drop(x)
         return x
 
@@ -491,14 +567,21 @@ class ACBlock(nn.Module):
             self.mlp = MLP(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=act_layer, drop=drop)
 
     def forward(self, x, mask=None, attn_mask=None, T=None, H=None, W=None, action_tokens=0):
+        logger.debug(f"In ACBlock forward, before norm1: x.shape: {x.shape}")
         y = self.norm1(x)
+        logger.debug(f"In ACBlock forward, after norm1: y.shape: {y.shape}")
+        logger.debug(f"isinstance(self.attn, ACRoPEAttention): {isinstance(self.attn, ACRoPEAttention)}, self.")
         if isinstance(self.attn, ACRoPEAttention):
             y = self.attn(y, mask=mask, attn_mask=attn_mask, T=T, H=H, W=W, action_tokens=action_tokens)
         else:
             y = self.attn(y, mask=mask, attn_mask=attn_mask)
+        logger.debug(f"In ACBlock forward, after attn: y.shape: {y.shape}")
         x = x + self.drop_path(y)
+        logger.debug(f"In ACBlock forward, after drop_path: x.shape: {x.shape}")
         y = self.norm2(x)
+        logger.debug(f"In ACBlock forward, after norm2: y.shape: {y.shape}")
         x = x + self.drop_path(self.mlp(y))
+        logger.debug(f"In ACBlock forward, after drop_path: x.shape: {x.shape}")
         return x
 
 
